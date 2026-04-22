@@ -1,325 +1,407 @@
+import os
 import sys
 import time
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
+import pandas as pd
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
 
 ROOT = Path(__file__).parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from utils.espn_api import fetch_espn_scoreboard, fetch_espn_power_index, fetch_espn_standings
-from utils.sportradar import fetch_sr_todays_schedule, fetch_sr_standings
-from utils.features import build_state
-from utils.database import save_prediction, get_recent_predictions, init_db
+from utils.database import init_db, save_prediction, get_recent_predictions
+from utils.espn_api  import fetch_espn_scoreboard, fetch_espn_standings, fetch_espn_power_index
+from utils.features  import build_state, FEATURE_NAMES
 
-st.set_page_config(
-    page_title="Live Predictions · NBA AI",
-    page_icon="🔴",
-    layout="wide",
-)
+st.set_page_config(page_title="Live Predictions · NBA AI", page_icon="🔴", layout="wide")
 
-# ── sys.path guard for agent ───────────────────────────────────────────────────
-if "db_initialized" not in st.session_state:
-    init_db()
-    st.session_state.db_initialized = True
+# ── Bootstrap ──────────────────────────────────────────────────────────────────
+if "db_ready" not in st.session_state:
+    init_db(); st.session_state.db_ready = True
 
 if "agent" not in st.session_state:
     from utils.dqn_agent import DQNAgent
-    _a = DQNAgent()
-    _a.load()
-    st.session_state.agent = _a
+    a = DQNAgent(); a.load(); st.session_state.agent = a
 
-# ── Session state for this page ────────────────────────────────────────────────
+if "improver" not in st.session_state:
+    import anthropic
+    from utils.self_improver import AutonomousImprover
+    _key = os.environ.get("ANTHROPIC_API_KEY","")
+    c    = anthropic.Anthropic(api_key=_key)
+    st.session_state.improver = AutonomousImprover(st.session_state.agent, c)
+    st.session_state.anthropic_client = c
+
 for key, default in [
-    ("score_cache",   {}),
-    ("cycle_count",   0),
-    ("sr_standings",  {}),
-    ("espn_bpi",      {}),
-    ("espn_standings",{}),
-    ("cached_games",  []),
-    ("last_heavy_ts", 0.0),
-    ("auto_refresh",  True),
-    ("last_errors",   []),
+    ("score_cache",       {}),
+    ("cycle_count",       0),
+    ("standings",         {}),
+    ("bpi",               {}),
+    ("live_games",        []),
+    ("last_heavy_ts",     0.0),
+    ("auto_refresh_live", True),
+    ("training_log",      []),
+    ("page_losses",       []),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
 
-# ── Auto-refresh every 60 seconds ─────────────────────────────────────────────
-if st.session_state.auto_refresh:
-    st_autorefresh(interval=60_000, key="live_autorefresh")
+agent    = st.session_state.agent
+improver = st.session_state.improver
+
+# ── Auto-refresh ───────────────────────────────────────────────────────────────
+from streamlit_autorefresh import st_autorefresh
+if st.session_state.auto_refresh_live:
+    st_autorefresh(interval=60_000, key="live_ar")
 
 # ── Header ─────────────────────────────────────────────────────────────────────
 st.markdown("## 🔴 Live Predictions")
-st.caption(f"Last rendered: {datetime.now().strftime('%H:%M:%S')}  ·  Cycle #{st.session_state.cycle_count + 1}")
+st.caption(f"Cycle #{st.session_state.cycle_count + 1}  ·  {datetime.now().strftime('%H:%M:%S')}")
 
-# ── Controls ───────────────────────────────────────────────────────────────────
-ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([2, 2, 2, 2])
-with ctrl1:
-    st.session_state.auto_refresh = st.toggle(
-        "⏱ Auto-refresh (60 s)", value=st.session_state.auto_refresh, key="toggle_ar"
+# ── Controls row ──────────────────────────────────────────────────────────────
+r1c1, r1c2, r1c3, r1c4, r1c5 = st.columns(5)
+with r1c1:
+    st.session_state.auto_refresh_live = st.toggle(
+        "⏱ Auto-refresh 60s", value=st.session_state.auto_refresh_live, key="tog_ar"
     )
-with ctrl2:
-    train_live = st.toggle("🎓 Train on completed games", value=True, key="toggle_train")
-with ctrl3:
-    use_sr = st.toggle("📡 Include SportRadar games", value=True, key="toggle_sr")
-with ctrl4:
-    if st.button("🔄 Refresh Now", key="btn_manual_refresh"):
+with r1c2:
+    train_live = st.toggle("🎓 Train on results", value=True, key="tog_train")
+with r1c3:
+    show_historical = st.toggle("📚 Include recent history", value=True, key="tog_hist")
+with r1c4:
+    days_back = st.selectbox("History days", [1, 3, 7], index=1, key="sel_hist_days")
+with r1c5:
+    if st.button("🔄 Refresh Now", key="btn_refresh", use_container_width=True):
+        st.session_state.last_heavy_ts = 0.0
         st.rerun()
 
 st.divider()
 
-# ── Data fetching (heavy calls throttled to every 5 minutes) ──────────────────
-now_ts  = time.time()
-is_cold = (now_ts - st.session_state.last_heavy_ts) > 300.0
-
-if is_cold:
-    with st.spinner("Fetching standings & power index…"):
+# ── Data fetch (always fresh on this page) ─────────────────────────────────────
+now = time.time()
+if (now - st.session_state.last_heavy_ts) > 55:   # refresh every ~60s matching autorefresh
+    with st.spinner("📡 Fetching live ESPN data…"):
         try:
-            sr_standings  = fetch_sr_standings()
-            espn_standings = fetch_espn_standings()
-            merged_standings = {**espn_standings, **sr_standings}  # SR wins on conflict
-            espn_bpi      = fetch_espn_power_index()
-            st.session_state.sr_standings   = merged_standings
-            st.session_state.espn_bpi       = espn_bpi
-            st.session_state.last_heavy_ts  = now_ts
-        except Exception as exc:
-            st.warning(f"Could not refresh standings: {exc}")
-            merged_standings = st.session_state.sr_standings
-            espn_bpi         = st.session_state.espn_bpi
+            today_games = fetch_espn_scoreboard()
+            standings   = fetch_espn_standings()
+            bpi         = fetch_espn_power_index()
+            st.session_state.live_games    = today_games
+            st.session_state.standings     = standings
+            st.session_state.bpi           = bpi
+            st.session_state.last_heavy_ts = now
+        except Exception as e:
+            st.error(f"ESPN fetch error: {e}")
+            today_games = st.session_state.live_games
+            standings   = st.session_state.standings
+            bpi         = st.session_state.bpi
 else:
-    merged_standings = st.session_state.sr_standings
-    espn_bpi         = st.session_state.espn_bpi
+    today_games = st.session_state.live_games
+    standings   = st.session_state.standings
+    bpi         = st.session_state.bpi
 
-# ── Fetch today's games ────────────────────────────────────────────────────────
-espn_games: list[dict] = []
-sr_games:   list[dict] = []
-
-with st.spinner("Fetching ESPN scoreboard…"):
-    try:
-        espn_games = fetch_espn_scoreboard()
-    except Exception as exc:
-        st.error(f"ESPN scoreboard error: {exc}")
-
-if use_sr:
-    with st.spinner("Fetching SportRadar schedule…"):
+# Historical games for training buffer warm-up
+historical: list[dict] = []
+if show_historical:
+    with st.spinner(f"📚 Loading {days_back}d historical data for training…"):
         try:
-            sr_games = fetch_sr_todays_schedule()
-        except Exception as exc:
-            st.warning(f"SportRadar schedule error: {exc}")
+            from utils.espn_api import fetch_espn_scoreboard_range
+            historical = fetch_espn_scoreboard_range(int(days_back))
+        except Exception as e:
+            st.warning(f"Historical fetch: {e}")
 
-# Deduplicate: prefer ESPN entries (richer odds), supplement with SR
-seen_matchups = {g["home_team"] + g["away_team"] for g in espn_games}
-all_games     = espn_games + [
-    g for g in sr_games
-    if (g["home_team"] + g["away_team"]) not in seen_matchups
+all_games = today_games + [
+    g for g in historical
+    if g["game_id"] not in {x["game_id"] for x in today_games}
 ]
 
 st.session_state.cycle_count += 1
 
 # ── Score-change detection ─────────────────────────────────────────────────────
-def detect_changes(games: list[dict]) -> list[dict]:
+def detect_changes(games: list[dict]) -> set[str]:
+    changed = set()
     cache   = st.session_state.score_cache
-    changed = []
     for g in games:
-        gid  = g.get("game_id", "")
+        gid  = g.get("game_id","")
+        curr = {"h": g.get("home_score",0), "a": g.get("away_score",0), "s": g.get("status","")}
         prev = cache.get(gid)
-        curr = {
-            "home": g.get("home_score", 0),
-            "away": g.get("away_score", 0),
-            "status": g.get("status", ""),
-        }
-        if prev is None:
-            cache[gid] = curr
-        elif prev != curr:
-            g["_changed"]   = True
-            g["_prev_home"] = prev["home"]
-            g["_prev_away"] = prev["away"]
-            cache[gid]      = curr
-            changed.append(g)
-        else:
-            g["_changed"] = False
+        if prev and prev != curr:
+            changed.add(gid)
+        cache[gid] = curr
     st.session_state.score_cache = cache
     return changed
 
+changed_ids = detect_changes(all_games)
 
-changed_games = detect_changes(all_games)
-
-# ── Build predictions ──────────────────────────────────────────────────────────
-agent         = st.session_state.agent
-predictions   = []
-training_logs = []
+# ── Build predictions + autonomous training ────────────────────────────────────
+predictions:   list[dict] = []
+training_logs: list[dict] = []
+session_losses: list[float] = []
 
 for game in all_games:
     try:
-        state          = build_state(game, merged_standings, espn_bpi)
-        action, conf   = agent.act_greedy(state)
-        pred_label     = game["home_team"] if action == 1 else game["away_team"]
-        h_score        = float(game.get("home_score", 0))
-        a_score        = float(game.get("away_score", 0))
-        spread         = float(game.get("odds_spread", 0.0) or 0.0)
-        is_final       = game.get("is_final", False) or game.get("status") in (
-            "STATUS_FINAL", "closed", "complete"
-        )
-        has_score      = h_score > 0 or a_score > 0
-        changed        = game.get("_changed", False)
+        state        = build_state(game, standings, bpi)
+        action, conf = agent.act_greedy(state)
+        pred_team    = game["home_team"] if action == 1 else game["away_team"]
+        h_score      = float(game.get("home_score", 0))
+        a_score      = float(game.get("away_score", 0))
+        spread       = float(game.get("odds_spread", 0.0) or 0.0)
+        is_final     = game.get("is_final", False)
+        has_score    = h_score > 0 or a_score > 0
+        changed      = game.get("game_id","") in changed_ids
 
         row = {
-            "matchup":    f"{game['away_team']}  @  {game['home_team']}",
-            "predicted":  pred_label,
-            "action":     action,
-            "confidence": conf,
-            "h_score":    h_score,
-            "a_score":    a_score,
-            "spread":     spread,
-            "status":     game.get("status_desc", game.get("status", "")),
-            "changed":    changed,
-            "is_final":   is_final,
-            "source":     game.get("source", "espn"),
-            "game_id":    game.get("game_id", ""),
-            "home_team":  game["home_team"],
-            "away_team":  game["away_team"],
+            "matchup":   game.get("matchup", f"{game['away_team']} @ {game['home_team']}"),
+            "home_team": game["home_team"],
+            "away_team": game["away_team"],
+            "home_abbr": game.get("home_abbr",""),
+            "away_abbr": game.get("away_abbr",""),
+            "predicted": pred_team,
+            "action":    action,
+            "conf":      conf,
+            "h_score":   h_score,
+            "a_score":   a_score,
+            "spread":    spread,
+            "ou":        game.get("over_under", 220.0),
+            "status":    game.get("status_desc", game.get("status","")),
+            "is_final":  is_final,
+            "is_live":   game.get("is_live", False),
+            "changed":   changed,
+            "source":    game.get("source","espn"),
+            "game_id":   game.get("game_id",""),
+            "venue":     game.get("venue",""),
+            "state":     state,
+            "trained":   False,
+            "correct":   None,
+            "reward":    None,
+            "lesson":    None,
         }
 
-        # ── Train on completed or score-changed games ──────────────────────────
         if train_live and has_score and (changed or is_final):
             actual        = 1 if h_score > a_score else 0
             actual_margin = h_score - a_score
             reward        = agent.calculate_reward(action, actual, spread, actual_margin)
 
-            agent.remember(state, action, reward, state, done=is_final)
-            loss = agent.replay(batch_size=64)
-
-            save_prediction(
-                game_id         = game.get("game_id", ""),
-                source          = game.get("source", "espn"),
-                home_team       = game["home_team"],
-                away_team       = game["away_team"],
-                prediction      = action,
-                actual_result   = actual,
-                predicted_margin= spread,
-                actual_margin   = actual_margin,
-                reward          = reward,
-                confidence      = conf,
+            # Route through autonomous improver (handles PER priority + analysis)
+            result = improver.process_result(
+                state      = state,
+                action     = action,
+                actual     = actual,
+                game_info  = {"matchup": row["matchup"]},
+                reward     = reward,
             )
 
-            row["actual"]   = actual
-            row["reward"]   = reward
-            row["trained"]  = True
-            training_logs.append({
-                "game":   row["matchup"],
-                "result": "✅ Correct" if action == actual else "❌ Wrong",
-                "reward": reward,
-                "loss":   loss,
+            # Also run explicit replay
+            loss = agent.replay(batch_size=64)
+            if loss is not None:
+                session_losses.append(loss)
+
+            save_prediction(
+                game_id          = game.get("game_id",""),
+                source           = game.get("source","espn"),
+                home_team        = game["home_team"],
+                away_team        = game["away_team"],
+                matchup          = row["matchup"],
+                prediction       = action,
+                actual_result    = actual,
+                predicted_margin = spread,
+                actual_margin    = actual_margin,
+                reward           = reward,
+                confidence       = conf,
+            )
+
+            row.update({
+                "trained": True,
+                "correct": action == actual,
+                "reward":  reward,
+                "lesson":  result.get("lesson"),
             })
-        else:
-            row["trained"] = False
+
+            training_logs.append({
+                "game":    row["matchup"],
+                "correct": action == actual,
+                "reward":  reward,
+                "lesson":  result.get("lesson",""),
+            })
 
         predictions.append(row)
 
-    except Exception as exc:
-        st.session_state.last_errors.append(str(exc))
+    except Exception as ex:
+        st.warning(f"Error on {game.get('home_team','?')}: {ex}")
 
-
-# ── Auto-save model if any training happened ───────────────────────────────────
+# Auto-save if any training happened
 if training_logs:
     try:
         agent.save()
-    except Exception as exc:
-        st.warning(f"Model save failed: {exc}")
+    except Exception:
+        pass
 
-# ── Summary bar ───────────────────────────────────────────────────────────────
-m1, m2, m3, m4 = st.columns(4)
-with m1:
-    st.metric("Games Today",      len(all_games))
-with m2:
-    st.metric("Score Updates",    len(changed_games))
+# Background retrain even without new results
+if not training_logs and len(agent.replay_buffer) >= 64:
+    bg_loss = improver.run_background_retrain(steps=30)
+    if bg_loss:
+        st.session_state.background_losses = (
+            st.session_state.get("background_losses", []) + [bg_loss]
+        )[-200:]
+
+# ── Summary metrics ────────────────────────────────────────────────────────────
+m1, m2, m3, m4, m5, m6 = st.columns(6)
+with m1: st.metric("Games Loaded",     len(all_games))
+with m2: st.metric("Today's Games",    len(today_games))
 with m3:
-    st.metric("Training Events",  len(training_logs))
-with m4:
-    st.metric("Agent ε",          f"{agent.epsilon:.4f}")
+    live_n = sum(1 for p in predictions if p["is_live"])
+    st.metric("🔴 Live",               live_n)
+with m4: st.metric("Training Events",  len(training_logs))
+with m5: st.metric("Agent ε",          f"{agent.epsilon:.4f}")
+with m6:
+    avg_loss = sum(session_losses)/len(session_losses) if session_losses else 0.0
+    st.metric("Avg Loss",              f"{avg_loss:.4f}" if session_losses else "—")
 
 st.divider()
 
-# ── Main predictions table ─────────────────────────────────────────────────────
-if not predictions:
-    st.info("📭 No games found for today. Check back during the NBA season, or refresh.")
-else:
-    for p in predictions:
-        status_icon = "🔴" if p["changed"] else ("✅" if p["is_final"] else "⏳")
-        score_str   = (
-            f"{p['a_score']:.0f} – {p['h_score']:.0f}"
-            if (p["h_score"] or p["a_score"])
-            else "–"
-        )
-        trained_tag = "🎓 Trained" if p["trained"] else ""
-        source_tag  = f"[{p['source'].upper()}]"
+# ── Tabs ───────────────────────────────────────────────────────────────────────
+tab_games, tab_training, tab_history, tab_diagnostics = st.tabs(
+    ["🏀 Games & Predictions", "🎓 Training Log", "📋 History", "🔧 Diagnostics"]
+)
 
-        with st.container():
-            ca, cb, cc, cd, ce = st.columns([3, 2, 1.5, 1.5, 1.5])
-            with ca:
-                st.markdown(f"**{status_icon} {p['matchup']}** {source_tag}")
-            with cb:
-                colour = "green" if p["confidence"] >= 65 else "orange"
-                st.markdown(f"🏆 :{colour}[**{p['predicted']}**]")
-            with cc:
-                st.markdown(f"`{p['confidence']:.1f}%` confidence")
-            with cd:
-                st.markdown(f"Score: **{score_str}**")
-            with ce:
-                st.markdown(f"{p['status']}  {trained_tag}")
-        st.markdown("---")
+with tab_games:
+    if not predictions:
+        st.info("📭 No games loaded. ESPN may not have today's schedule yet.")
+    else:
+        # Group: live → upcoming → final → historical
+        live_preds  = [p for p in predictions if p["is_live"]]
+        sched_preds = [p for p in predictions if not p["is_live"] and not p["is_final"] and p["h_score"] == 0]
+        final_preds = [p for p in predictions if p["is_final"]]
+        hist_preds  = [p for p in predictions if not p["is_live"] and not p["is_final"] and p["h_score"] > 0 and p not in sched_preds]
 
-# ── Training log expander ──────────────────────────────────────────────────────
-if training_logs:
-    with st.expander(f"🎓 Training Events This Cycle ({len(training_logs)})", expanded=True):
+        def render_game_table(preds: list[dict]) -> None:
+            for p in preds:
+                status_icon = "🔴" if p["is_live"] else ("✅" if p["is_final"] else "⏳")
+                score_str   = f"{p['a_score']:.0f}–{p['h_score']:.0f}" if (p["h_score"] or p["a_score"]) else "TBD"
+                result_icon = ""
+                if p["correct"] is True:   result_icon = " ✅"
+                elif p["correct"] is False: result_icon = " ❌"
+                trained_tag = " 🎓" if p["trained"] else ""
+
+                with st.container():
+                    c1, c2, c3, c4, c5, c6 = st.columns([3, 2.5, 1.5, 1.5, 1.5, 1.5])
+                    with c1:
+                        st.markdown(f"**{status_icon} {p['matchup']}**")
+                        if p["venue"]:
+                            st.caption(p["venue"])
+                    with c2:
+                        conf_col = "green" if p["conf"] >= 65 else "orange"
+                        st.markdown(f"🏆 :{conf_col}[**{p['predicted']}**]{result_icon}{trained_tag}")
+                    with c3:
+                        st.metric("Confidence", f"{p['conf']:.1f}%", label_visibility="collapsed")
+                        st.caption(f"{p['conf']:.1f}% conf")
+                    with c4:
+                        st.markdown(f"**{score_str}**")
+                        st.caption(p["status"])
+                    with c5:
+                        st.caption(f"Spread: {p['spread']:.1f}")
+                        st.caption(f"O/U: {p['ou']:.1f}")
+                    with c6:
+                        if p["reward"] is not None:
+                            r_col = "green" if p["reward"] > 0 else "red"
+                            st.markdown(f":{r_col}[{p['reward']:+.2f}]")
+                st.markdown("---")
+
+        if live_preds:
+            st.subheader(f"🔴 Live Games ({len(live_preds)})")
+            render_game_table(live_preds)
+
+        if sched_preds:
+            st.subheader(f"⏳ Upcoming Today ({len(sched_preds)})")
+            render_game_table(sched_preds)
+
+        if final_preds:
+            st.subheader(f"✅ Final Today ({len(final_preds)})")
+            render_game_table(final_preds)
+
+        if hist_preds:
+            with st.expander(f"📚 Historical ({days_back}d) — {len(hist_preds)} games"):
+                render_game_table(hist_preds[:20])
+
+with tab_training:
+    if not training_logs:
+        st.info("No training events this cycle. Training fires when game scores update or games finish.")
+        if st.session_state.background_losses:
+            st.subheader("Background Retrain Loss")
+            st.line_chart(
+                pd.DataFrame({"Loss": st.session_state.background_losses[-50:]}),
+                use_container_width=True,
+            )
+    else:
         for t in training_logs:
-            loss_str = f"loss={t['loss']:.4f}" if t["loss"] is not None else "buffer warming up"
+            icon = "✅" if t["correct"] else "❌"
             st.markdown(
-                f"- **{t['game']}** → {t['result']}  |  "
-                f"reward={t['reward']:+.2f}  |  {loss_str}"
+                f"{icon} **{t['game']}** — reward: `{t['reward']:+.2f}`"
+                + (f" — *{t['lesson']}*" if t.get("lesson") else "")
             )
 
-# ── Agent diagnostics expander ─────────────────────────────────────────────────
-with st.expander("🔧 Agent Diagnostics", expanded=False):
-    dcol1, dcol2 = st.columns(2)
-    sd = agent.get_state_dict()
-    with dcol1:
-        st.json(sd)
-    with dcol2:
-        st.caption("Replay buffer occupancy")
-        buf_pct = len(agent.memory) / 5000
-        st.progress(buf_pct, text=f"{len(agent.memory)} / 5000 experiences")
-        if st.session_state.last_errors:
-            st.warning("Recent errors:")
-            for err in st.session_state.last_errors[-5:]:
-                st.code(err)
-            if st.button("Clear errors", key="btn_clear_err"):
-                st.session_state.last_errors = []
-                st.rerun()
+        if session_losses:
+            st.subheader("Training Loss This Cycle")
+            st.line_chart(
+                pd.DataFrame({"Huber Loss": session_losses}),
+                use_container_width=True,
+            )
 
-# ── Recent prediction history ──────────────────────────────────────────────────
-with st.expander("📋 Recent Prediction History (last 20)", expanded=False):
-    import pandas as pd
-    recent = get_recent_predictions(20)
-    if recent:
-        df = pd.DataFrame(recent)
-        st.dataframe(
-            df[["timestamp", "home_team", "away_team", "prediction",
-                "actual_result", "reward", "confidence"]].rename(columns={
-                "home_team": "Home",
-                "away_team": "Away",
-                "prediction": "Pred (1=Home)",
-                "actual_result": "Actual",
-                "reward": "Reward",
-                "confidence": "Conf %",
-                "timestamp": "Time",
-            }),
-            use_container_width=True,
-            hide_index=True,
-        )
-    else:
+        st.subheader("Autonomous Improver Status")
+        ic1, ic2, ic3 = st.columns(3)
+        with ic1: st.metric("Total Misses",  improver.total_misses)
+        with ic2: st.metric("Total Correct", improver.total_correct)
+        with ic3: st.metric("Lessons",       len(improver.lessons))
+
+        if improver.last_analysis:
+            la = improver.last_analysis
+            st.success(f"**Latest lesson:** {la.get('lesson','')}")
+            st.caption(f"Bias: {la.get('bias_detected','')}  |  Expected Δ: +{la.get('predicted_improvement',0)*100:.1f}%")
+
+with tab_history:
+    limit = st.selectbox("Show records", [25, 50, 100, 200], key="sel_hist_limit")
+    recent = get_recent_predictions(int(limit))
+    if not recent:
         st.info("No prediction history yet.")
+    else:
+        df = pd.DataFrame(recent)
+        df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.strftime("%m-%d %H:%M")
+        df["result"]    = df.apply(
+            lambda r: (
+                "✅" if r.get("prediction") == r.get("actual_result") and r.get("actual_result") is not None
+                else ("❌" if r.get("actual_result") is not None else "⏳")
+            ), axis=1,
+        )
+        show_cols = ["timestamp","matchup","result","confidence","reward","source"]
+        show_cols = [c for c in show_cols if c in df.columns]
+        st.dataframe(
+            df[show_cols].rename(columns={
+                "timestamp":  "Time",
+                "matchup":    "Game",
+                "result":     "Result",
+                "confidence": "Conf%",
+                "reward":     "Reward",
+                "source":     "Src",
+            }),
+            use_container_width=True, hide_index=True,
+        )
+        csv = df.to_csv(index=False)
+        st.download_button("⬇️ CSV", csv, "predictions.csv", "text/csv", key="dl_pred_csv")
+
+with tab_diagnostics:
+    dc1, dc2 = st.columns(2)
+    with dc1:
+        st.subheader("Agent State")
+        st.json(agent.get_state_dict())
+    with dc2:
+        st.subheader("Buffer Health")
+        buf = len(agent.replay_buffer)
+        st.progress(buf / 10_000, text=f"{buf:,} / 10 000 experiences")
+        st.caption(f"Adam step t={agent.online.t}")
+        if st.button("💾 Force Save Model", key="btn_force_save"):
+            agent.save()
+            st.toast("Model saved!", icon="💾")
+        if st.button("🔄 Force Data Refresh", key="btn_force_refresh"):
+            st.session_state.last_heavy_ts = 0.0
+            st.rerun()

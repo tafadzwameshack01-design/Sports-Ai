@@ -1,8 +1,7 @@
-import sys
 import os
+import sys
 import json
 import difflib
-import time
 from pathlib import Path
 from datetime import datetime
 
@@ -16,456 +15,340 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from utils.database import (
-    init_db, save_optimizer_run, get_optimizer_history,
-    get_model_metrics,
+    init_db, save_optimizer_run, get_optimizer_history, get_model_metrics,
+    save_lesson, get_lessons,
 )
 from utils.features import run_monte_carlo
 
-st.set_page_config(
-    page_title="AI Optimizer · NBA AI",
-    page_icon="🤖",
-    layout="wide",
-)
+st.set_page_config(page_title="AI Optimizer · NBA AI", page_icon="🤖", layout="wide")
 
-# ── Constants ──────────────────────────────────────────────────────────────────
 MODEL_NAME          = "claude-sonnet-4-20250514"
-MAX_TOKENS_OPTIMIZER = 2048
-PERFORMANCE_THRESHOLD = 0.55  # 55% win-rate is minimum acceptable
+PERF_THRESHOLD      = 0.55
 
-# ── Session init ───────────────────────────────────────────────────────────────
-if "db_initialized" not in st.session_state:
-    init_db()
-    st.session_state.db_initialized = True
-
+if "db_ready" not in st.session_state:
+    init_db(); st.session_state.db_ready = True
 if "agent" not in st.session_state:
     from utils.dqn_agent import DQNAgent
-    _a = DQNAgent()
-    _a.load()
-    st.session_state.agent = _a
+    a = DQNAgent(); a.load(); st.session_state.agent = a
+
+ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY","")
+if not ANTHROPIC_KEY:
+    st.error("ANTHROPIC_API_KEY missing"); st.stop()
+client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 
 for key, default in [
-    ("stop_flag",           False),
-    ("iteration_log",       []),
-    ("optimizer_scores",    []),
-    ("previous_agent_state", None),
-    ("opt_running",         False),
-    ("best_hyperparams",    None),
-    ("best_score",          0.0),
+    ("stop_flag",       False),
+    ("iteration_log",   []),
+    ("opt_scores",      []),
+    ("previous_hp",     None),
+    ("best_hp",         None),
+    ("best_score",      0.0),
+    ("opt_running",     False),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
 
-# ── Anthropic client ───────────────────────────────────────────────────────────
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-if not ANTHROPIC_API_KEY:
-    st.error("ANTHROPIC_API_KEY not set.")
-    st.stop()
-
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
-# ── Helper: build Claude optimizer prompt ─────────────────────────────────────
-def build_optimizer_prompt(
-    current_hyperparams: dict,
-    current_score: float,
-    iteration_history: list[dict],
-    mc_stats: dict,
-    db_metrics: dict,
-) -> str:
-    history_summary = "\n".join(
-        f"  Iter {h['iteration']}: score={h['score']:.4f}  params={json.dumps(h['hyperparams'])}"
-        for h in iteration_history[-5:]
-    ) or "  (first iteration)"
-
-    return f"""You are optimizing hyperparameters for a Deep Q-Network (DQN) that predicts NBA game outcomes.
-
-CURRENT CONFIGURATION:
-{json.dumps(current_hyperparams, indent=2)}
-
-CURRENT PERFORMANCE:
-- Monte Carlo win rate: {mc_stats.get('win_rate', 0)*100:.1f}%
-- Avg reward: {mc_stats.get('avg_reward', 0):+.4f}
-- 95% CI: [{mc_stats.get('ci_low', 0):+.4f}, {mc_stats.get('ci_high', 0):+.4f}]
-- Historical accuracy: {db_metrics.get('accuracy', 0):.1f}%
-- Current epsilon: {current_hyperparams.get('epsilon', 1.0):.4f}
-- Training steps completed: {current_hyperparams.get('steps', 0)}
-- Replay buffer: {current_hyperparams.get('memory_size', 0)} experiences
-
-OPTIMIZATION HISTORY (last 5 iterations):
-{history_summary}
-
-OPTIMIZATION OBJECTIVE:
-Maximize the composite score = 0.6 * win_rate + 0.4 * normalized_reward
-Target: score > {PERFORMANCE_THRESHOLD}
-
-CONSTRAINTS:
-- learning_rate: [0.00001, 0.01]
-- gamma: [0.80, 0.999]
-- epsilon_decay: [0.990, 0.9999]
-- epsilon_min: [0.01, 0.20]
-
-TASK:
-1. Analyze the current performance and history
-2. Suggest improved hyperparameter values
-3. Predict the expected composite score after these changes
-4. Explain your reasoning
-
-Return ONLY a valid JSON object (no markdown, no preamble) with this exact structure:
-{{
-  "suggested_hyperparams": {{
-    "lr": <float>,
-    "gamma": <float>,
-    "epsilon_decay": <float>,
-    "epsilon_min": <float>
-  }},
-  "predicted_score": <float between 0 and 1>,
-  "reasoning": "<brief explanation under 100 words>",
-  "iteration_score": <float between 0 and 1>
-}}"""
-
-
-# ── Helper: compute composite performance score ────────────────────────────────
-def compute_composite_score(mc_stats: dict, db_metrics: dict) -> float:
-    win_rate      = mc_stats.get("win_rate",   0.0)
-    avg_reward    = mc_stats.get("avg_reward", 0.0)
-    norm_reward   = (avg_reward + 1.0) / 2.5  # map [-1, 1.5] → [0, 1]
-    return round(0.6 * win_rate + 0.4 * norm_reward, 4)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  PAGE LAYOUT
-# ══════════════════════════════════════════════════════════════════════════════
-st.markdown("## 🤖 AI Optimizer")
-st.caption(
-    "Claude-powered self-improvement loop · auto-calibrates DQN hyperparameters · "
-    "rolls back if performance degrades"
-)
-st.divider()
-
 agent      = st.session_state.agent
 db_metrics = get_model_metrics()
 
-# ── Current metrics display ────────────────────────────────────────────────────
-opt_tab, hist_tab = st.tabs(["🔄 Optimization Loop", "📊 Optimization History"])
 
-with opt_tab:
-    km1, km2, km3, km4 = st.columns(4)
-    with km1:
-        st.metric("Current Accuracy",  f"{db_metrics.get('accuracy', 0):.1f}%")
-    with km2:
-        st.metric("Predictions Total", db_metrics.get("total", 0))
-    with km3:
-        st.metric("Agent ε",           f"{agent.epsilon:.4f}")
-    with km4:
-        st.metric("Training Steps",    f"{agent.steps:,}")
+def composite_score(mc: dict, dbm: dict) -> float:
+    wr   = mc.get("win_rate",   0.0)
+    ar   = mc.get("avg_reward", 0.0)
+    nr   = (ar + 1.0) / 2.5
+    return round(0.6 * wr + 0.4 * nr, 4)
+
+
+def claude_optimize(agent, cur_score: float, history: list, mc: dict, dbm: dict) -> dict:
+    history_txt = "\n".join(
+        f"  iter {h['iteration']}: score={h['score_after']:.4f} params={json.dumps(h['hyperparams'])}"
+        for h in history[-5:]
+    ) or "  (first iteration)"
+
+    prompt = f"""Optimize hyperparameters for a Double DQN NBA prediction agent.
+
+CURRENT HYPERPARAMETERS:
+{json.dumps(agent.get_state_dict(), indent=2)}
+
+CURRENT PERFORMANCE:
+- Composite score  : {cur_score:.4f}  (target > {PERF_THRESHOLD})
+- MC win rate      : {mc.get('win_rate',0)*100:.1f}%
+- Avg reward       : {mc.get('avg_reward',0):+.4f}
+- 95% CI           : [{mc.get('ci_low',0):+.4f}, {mc.get('ci_high',0):+.4f}]
+- Historical acc   : {dbm.get('accuracy',0):.1f}%
+- Total predictions: {dbm.get('total',0)}
+
+RECENT ITERATION HISTORY:
+{history_txt}
+
+CONSTRAINTS:
+  lr: [0.00001, 0.01]
+  gamma: [0.80, 0.999]
+  epsilon_decay: [0.990, 0.9999]
+  epsilon_min: [0.01, 0.20]
+
+COMPOSITE SCORE FORMULA: 0.6 * win_rate + 0.4 * normalized_reward
+(normalized_reward = (avg_reward + 1.0) / 2.5)
+
+Analyze the history, identify what's holding performance back, and suggest improved values.
+
+Return ONLY valid JSON — no markdown, no preamble:
+{{
+  "suggested_hyperparams": {{"lr": <float>, "gamma": <float>, "epsilon_decay": <float>, "epsilon_min": <float>}},
+  "predicted_score": <float 0-1>,
+  "iteration_score": <float 0-1>,
+  "reasoning": "<2-3 sentences>",
+  "bias_detected": "<one line — what pattern is hurting performance>"
+}}"""
+
+    resp = client.messages.create(
+        model       = MODEL_NAME,
+        max_tokens  = 1024,
+        temperature = 0.25,
+        system      = "You are a reinforcement-learning optimization expert. Return ONLY valid JSON.",
+        messages    = [{"role":"user","content": prompt}],
+    )
+    raw  = resp.content[0].text.strip()
+    return json.loads(raw.replace("```json","").replace("```","").strip())
+
+
+# ── Layout ─────────────────────────────────────────────────────────────────────
+st.markdown("## 🤖 AI Optimizer")
+st.caption("Claude-powered hyperparameter calibration · autonomous self-improvement loop · rollback support")
+st.divider()
+
+tab_loop, tab_lessons_tab, tab_hist = st.tabs(["🔄 Optimization Loop", "🧠 Lessons Log", "📜 History"])
+
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_loop:
+    km1,km2,km3,km4 = st.columns(4)
+    with km1: st.metric("Accuracy",       f"{db_metrics.get('accuracy',0):.1f}%")
+    with km2: st.metric("Predictions",    db_metrics.get("total",0))
+    with km3: st.metric("ε",              f"{agent.epsilon:.4f}")
+    with km4: st.metric("Best Score",     f"{st.session_state.best_score:.4f}")
 
     st.divider()
 
-    # ── Configuration ──────────────────────────────────────────────────────────
     cfg1, cfg2, cfg3 = st.columns(3)
-    with cfg1:
-        max_iterations = st.slider(
-            "Max iterations", min_value=1, max_value=10, value=5, step=1, key="sl_max_iter"
-        )
-    with cfg2:
-        mc_sims = st.slider(
-            "MC sims per iteration", min_value=500, max_value=2000, value=1000, step=250,
-            key="sl_mc_sims"
-        )
-    with cfg3:
-        auto_save = st.checkbox("Auto-save best model", value=True, key="cb_auto_save")
+    with cfg1: max_iters = st.slider("Max iterations",  1, 10, 5, key="sl_max_iter")
+    with cfg2: mc_sims   = st.slider("MC sims / iter", 500, 2000, 1000, 250, key="sl_mc")
+    with cfg3: auto_save = st.checkbox("Auto-save best model", value=True, key="cb_autosave")
 
     st.divider()
 
-    # ── Start / Stop controls ──────────────────────────────────────────────────
-    btn_col1, btn_col2, btn_col3 = st.columns(3)
-
-    with btn_col1:
-        start_btn = st.button(
-            "🚀 Start Optimization Loop", key="btn_opt_start",
-            disabled=st.session_state.opt_running,
-            use_container_width=True,
-        )
-    with btn_col2:
-        if st.button("⏹ Stop", key="btn_opt_stop", use_container_width=True):
+    bc1, bc2, bc3 = st.columns(3)
+    with bc1:
+        start = st.button("🚀 Start Optimization", key="btn_start",
+                          disabled=st.session_state.opt_running,
+                          use_container_width=True)
+    with bc2:
+        if st.button("⏹ Stop", key="btn_stop", use_container_width=True):
             st.session_state.stop_flag = True
-            st.toast("Stop requested — will halt after current iteration.", icon="⏹")
-    with btn_col3:
-        if st.button("↩ Rollback to Previous", key="btn_rollback",
-                     disabled=st.session_state.previous_agent_state is None,
+            st.toast("Stop requested.", icon="⏹")
+    with bc3:
+        prev_hp = st.session_state.previous_hp
+        if st.button("↩ Rollback", key="btn_rollback",
+                     disabled=prev_hp is None,
                      use_container_width=True):
-            prev = st.session_state.previous_agent_state
-            if prev:
-                agent.update_hyperparams(
-                    lr            = prev["lr"],
-                    gamma         = prev["gamma"],
-                    epsilon_decay = prev["epsilon_decay"],
-                    epsilon_min   = prev["epsilon_min"],
-                )
-                st.session_state.agent = agent
-                st.toast("Rolled back to previous hyperparameters.", icon="↩")
-                st.rerun()
+            agent.update_hyperparams(**{k:v for k,v in prev_hp.items()
+                                        if k in ("lr","gamma","epsilon_decay","epsilon_min")})
+            st.session_state.agent = agent
+            st.toast("Rolled back.", icon="↩")
+            st.rerun()
 
-    # ── Main optimization loop ─────────────────────────────────────────────────
-    if start_btn:
-        st.session_state.opt_running    = True
-        st.session_state.stop_flag      = False
-        st.session_state.iteration_log  = []
-        st.session_state.optimizer_scores = []
+    if start:
+        st.session_state.opt_running   = True
+        st.session_state.stop_flag     = False
+        st.session_state.iteration_log = []
+        st.session_state.opt_scores    = []
 
-        progress_bar    = st.progress(0.0, text="Starting optimization loop…")
-        status_area     = st.empty()
-        log_placeholder = st.empty()
+        progress  = st.progress(0.0, text="Starting…")
+        status    = st.empty()
+        log_area  = st.empty()
 
-        for iteration in range(1, max_iterations + 1):
+        for it in range(1, max_iters + 1):
             if st.session_state.stop_flag:
-                status_area.warning(f"⏹ Loop stopped at iteration {iteration - 1}.")
+                status.warning(f"Stopped at iteration {it-1}.")
                 break
 
-            progress_bar.progress(
-                iteration / max_iterations,
-                text=f"Iteration {iteration}/{max_iterations}",
-            )
-            status_area.info(f"🔄 Iteration {iteration}: running Monte Carlo simulation…")
+            progress.progress(it/max_iters, text=f"Iteration {it}/{max_iters}")
+            status.info(f"🔄 Iter {it}: running Monte Carlo ({mc_sims:,} sims)…")
 
-            # ── Step 1: evaluate current performance ──────────────────────────
-            mc_stats   = run_monte_carlo(agent, n_simulations=mc_sims, seed=iteration * 13)
-            cur_score  = compute_composite_score(mc_stats, db_metrics)
+            mc_before = run_monte_carlo(agent, mc_sims, seed=it*13)
+            score_before = composite_score(mc_before, db_metrics)
 
-            # ── Step 2: save previous state for rollback ───────────────────────
-            st.session_state.previous_agent_state = {
+            st.session_state.previous_hp = {
                 "lr":            agent.lr,
                 "gamma":         agent.gamma,
                 "epsilon_decay": agent.epsilon_decay,
                 "epsilon_min":   agent.epsilon_min,
             }
 
-            # ── Step 3: ask Claude for better hyperparams ──────────────────────
-            status_area.info(f"🤖 Iteration {iteration}: consulting Claude for hyperparameter suggestions…")
-            current_hp = {
-                **agent.get_state_dict(),
-                "lr": agent.lr,
-            }
-
+            status.info(f"🤖 Iter {it}: consulting Claude…")
             try:
-                response = client.messages.create(
-                    model       = MODEL_NAME,
-                    max_tokens  = MAX_TOKENS_OPTIMIZER,
-                    temperature = 0.3,
-                    system      = (
-                        "You are a machine learning optimization expert specializing in "
-                        "reinforcement learning for sports prediction. Return ONLY valid JSON."
-                    ),
-                    messages    = [
-                        {
-                            "role": "user",
-                            "content": build_optimizer_prompt(
-                                current_hp,
-                                cur_score,
-                                st.session_state.iteration_log,
-                                mc_stats,
-                                db_metrics,
-                            ),
-                        }
-                    ],
-                )
-                raw_text = response.content[0].text.strip()
+                suggestion    = claude_optimize(agent, score_before,
+                                                st.session_state.iteration_log,
+                                                mc_before, db_metrics)
+                sug_hp        = suggestion.get("suggested_hyperparams", {})
+                reasoning     = suggestion.get("reasoning","")
+                bias_detected = suggestion.get("bias_detected","")
+            except Exception as e:
+                st.warning(f"Claude failed (iter {it}): {e}")
+                sug_hp = {}; reasoning = f"Error: {e}"; bias_detected = ""
 
-                try:
-                    suggestion = json.loads(raw_text)
-                except json.JSONDecodeError:
-                    cleaned = raw_text.replace("```json", "").replace("```", "").strip()
-                    suggestion = json.loads(cleaned)
-
-                suggested_hp  = suggestion.get("suggested_hyperparams", {})
-                predicted_sc  = float(suggestion.get("predicted_score",  cur_score))
-                reasoning     = str(suggestion.get("reasoning",           "No reasoning provided"))
-                iter_score    = float(suggestion.get("iteration_score",   cur_score))
-
-            except Exception as exc:
-                st.warning(f"Claude call failed (iter {iteration}): {exc} — keeping current params")
-                suggested_hp  = {}
-                predicted_sc  = cur_score
-                reasoning     = f"Claude API error: {exc}"
-                iter_score    = cur_score
-
-            # ── Step 4: apply suggestions ──────────────────────────────────────
-            if suggested_hp:
+            if sug_hp:
                 agent.update_hyperparams(
-                    lr            = suggested_hp.get("lr"),
-                    gamma         = suggested_hp.get("gamma"),
-                    epsilon_decay = suggested_hp.get("epsilon_decay"),
-                    epsilon_min   = suggested_hp.get("epsilon_min"),
+                    lr            = sug_hp.get("lr"),
+                    gamma         = sug_hp.get("gamma"),
+                    epsilon_decay = sug_hp.get("epsilon_decay"),
+                    epsilon_min   = sug_hp.get("epsilon_min"),
                 )
 
-            # ── Step 5: re-evaluate after applying ────────────────────────────
-            mc_after   = run_monte_carlo(agent, n_simulations=mc_sims, seed=(iteration + 100) * 7)
-            new_score  = compute_composite_score(mc_after, db_metrics)
+            status.info(f"🎲 Iter {it}: re-evaluating after changes…")
+            mc_after     = run_monte_carlo(agent, mc_sims, seed=(it+100)*7)
+            score_after  = composite_score(mc_after, db_metrics)
 
-            # ── Step 6: rollback if degraded ──────────────────────────────────
-            if new_score < cur_score - 0.02:
-                prev = st.session_state.previous_agent_state
-                agent.update_hyperparams(
-                    lr            = prev["lr"],
-                    gamma         = prev["gamma"],
-                    epsilon_decay = prev["epsilon_decay"],
-                    epsilon_min   = prev["epsilon_min"],
-                )
-                rollback_note = f"⚠️ Rolled back (score dropped {cur_score:.4f} → {new_score:.4f})"
-                new_score     = cur_score
-            else:
-                rollback_note = ""
+            # Rollback if degraded > 2%
+            rollback_note = ""
+            if score_after < score_before - 0.02:
+                prev = st.session_state.previous_hp
+                agent.update_hyperparams(**{k:v for k,v in prev.items()
+                                           if k in ("lr","gamma","epsilon_decay","epsilon_min")})
+                rollback_note = f"↩ Rolled back ({score_before:.4f}→{score_after:.4f})"
+                score_after   = score_before
 
-            # ── Step 7: track best ─────────────────────────────────────────────
-            if new_score > st.session_state.best_score:
-                st.session_state.best_score      = new_score
-                st.session_state.best_hyperparams = agent.get_state_dict()
+            # Track best
+            if score_after > st.session_state.best_score:
+                st.session_state.best_score = score_after
+                st.session_state.best_hp    = agent.get_state_dict()
                 if auto_save:
-                    try:
-                        agent.save(Path("dqn_best_optimizer.keras"))
-                    except Exception as exc:
-                        pass
+                    try: agent.save(Path("dqn_best_optimizer.npy"))
+                    except Exception: pass
 
-            # ── Step 8: log ────────────────────────────────────────────────────
-            log_entry = {
-                "iteration":    iteration,
-                "score_before": round(cur_score,  4),
-                "score_after":  round(new_score,  4),
-                "score_delta":  round(new_score - cur_score, 4),
-                "hyperparams":  dict(suggested_hp) or {"no_change": True},
+            entry = {
+                "iteration":    it,
+                "score_before": round(score_before, 4),
+                "score_after":  round(score_after,  4),
+                "score_delta":  round(score_after - score_before, 4),
+                "hyperparams":  sug_hp or {"no_change": True},
                 "reasoning":    reasoning,
+                "bias_detected": bias_detected,
                 "mc_win_rate":  round(mc_after["win_rate"], 4),
                 "rollback":     bool(rollback_note),
             }
-            st.session_state.iteration_log.append(log_entry)
-            st.session_state.optimizer_scores.append(new_score)
+            st.session_state.iteration_log.append(entry)
+            st.session_state.opt_scores.append(score_after)
 
             save_optimizer_run(
-                iteration   = iteration,
-                hyperparams = json.dumps(suggested_hp),
-                score       = new_score,
-                notes       = f"{reasoning}  {rollback_note}",
+                iteration=it, hyperparams=json.dumps(sug_hp),
+                score=score_after, notes=f"{reasoning}  {rollback_note}",
             )
 
-            # Update display
-            with log_placeholder.container():
-                with st.expander(
-                    f"📋 Iteration Log ({len(st.session_state.iteration_log)} entries)",
-                    expanded=True,
-                ):
+            # Save lesson to DB
+            if bias_detected:
+                save_lesson({
+                    "bias_detected":         bias_detected,
+                    "lesson":                reasoning,
+                    "reasoning":             reasoning,
+                    "predicted_improvement": suggestion.get("predicted_score",0) - score_before,
+                    "total_misses":          0,
+                    "total_correct":         0,
+                })
+
+            with log_area.container():
+                with st.expander(f"📋 Iteration Log ({it} entries)", expanded=True):
                     for e in reversed(st.session_state.iteration_log):
-                        delta_color = "🟢" if e["score_delta"] >= 0 else "🔴"
-                        rb_icon     = " ↩" if e["rollback"] else ""
+                        dc = "🟢" if e["score_delta"] >= 0 else "🔴"
+                        rb = " ↩" if e["rollback"] else ""
                         st.markdown(
-                            f"**Iter {e['iteration']}** {delta_color} "
-                            f"score: {e['score_before']:.4f} → {e['score_after']:.4f} "
+                            f"**Iter {e['iteration']}** {dc} "
+                            f"{e['score_before']:.4f} → {e['score_after']:.4f} "
                             f"(Δ{e['score_delta']:+.4f}) "
-                            f"win_rate={e['mc_win_rate']*100:.1f}%{rb_icon}"
+                            f"win={e['mc_win_rate']*100:.1f}%{rb}"
                         )
-                        st.caption(f"Reasoning: {e['reasoning']}")
+                        if e.get("bias_detected"):
+                            st.caption(f"🔍 {e['bias_detected']}")
+                        st.caption(e['reasoning'])
                         st.markdown("---")
 
-        # ── Loop complete ──────────────────────────────────────────────────────
-        progress_bar.progress(1.0, text="Optimization complete!")
+        progress.progress(1.0, text="Complete!")
         st.session_state.opt_running = False
         st.session_state.agent       = agent
         agent.save()
-
-        status_area.success(
-            f"✅ Optimization complete — best score: {st.session_state.best_score:.4f}  "
-            f"({max_iterations} iterations)"
+        status.success(
+            f"✅ Optimization complete — best score: {st.session_state.best_score:.4f}"
         )
-        st.toast("Optimization loop finished!", icon="🎉")
+        st.toast("Optimization done!", icon="🎉")
 
-    # ── Score history chart ────────────────────────────────────────────────────
-    if st.session_state.optimizer_scores:
+    if st.session_state.opt_scores:
         st.subheader("Composite Score per Iteration")
         st.line_chart(
             pd.DataFrame(
-                {"Composite Score": st.session_state.optimizer_scores},
-                index=list(range(1, len(st.session_state.optimizer_scores) + 1)),
+                {"Score": st.session_state.opt_scores},
+                index=list(range(1, len(st.session_state.opt_scores)+1)),
             ),
-            use_container_width=True,
-            color="#6c63ff",
+            use_container_width=True, color="#6c63ff",
         )
 
-    # ── Before/after diff ─────────────────────────────────────────────────────
-    if (
-        st.session_state.previous_agent_state
-        and st.session_state.best_hyperparams
-    ):
-        st.subheader("Before / After Comparison")
-        before_lines = json.dumps(st.session_state.previous_agent_state, indent=2).splitlines(keepends=True)
-        after_lines  = json.dumps(
-            {k: v for k, v in st.session_state.best_hyperparams.items()
-             if k in ("lr", "gamma", "epsilon_decay", "epsilon_min")},
-            indent=2
+    if st.session_state.previous_hp and st.session_state.best_hp:
+        st.subheader("Before / After Diff")
+        before_lines = json.dumps(
+            {k:v for k,v in st.session_state.previous_hp.items()
+             if k in ("lr","gamma","epsilon_decay","epsilon_min")}, indent=2
         ).splitlines(keepends=True)
-        diff = list(difflib.unified_diff(before_lines, after_lines, fromfile="before", tofile="best"))
+        after_lines  = json.dumps(
+            {k:v for k,v in (st.session_state.best_hp or {}).items()
+             if k in ("lr","gamma","epsilon_decay","epsilon_min","epsilon")}, indent=2
+        ).splitlines(keepends=True)
+        diff = list(difflib.unified_diff(before_lines, after_lines,
+                                         fromfile="before", tofile="best"))
         if diff:
             st.code("".join(diff), language="diff")
         else:
-            st.info("No parameter changes during this optimization run.")
-
-    # ── Full iteration log ─────────────────────────────────────────────────────
-    if st.session_state.iteration_log:
-        with st.expander("📋 Full Iteration Log", expanded=False):
-            for e in st.session_state.iteration_log:
-                delta_color = "green" if e["score_delta"] >= 0 else "red"
-                st.markdown(
-                    f"**Iteration {e['iteration']}**  ·  "
-                    f":{delta_color}[score Δ {e['score_delta']:+.4f}]  ·  "
-                    f"win_rate={e['mc_win_rate']*100:.1f}%"
-                )
-                st.json(e["hyperparams"])
-                st.caption(e["reasoning"])
-                st.markdown("---")
+            st.info("No parameter changes this run.")
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  TAB 2: Optimization History
-# ══════════════════════════════════════════════════════════════════════════════
-with hist_tab:
-    st.subheader("All Optimization Runs")
-
-    opt_hist = get_optimizer_history(100)
-    if not opt_hist:
-        st.info("No optimization runs yet. Start the loop in **🔄 Optimization Loop** tab.")
+with tab_lessons_tab:
+    st.subheader("All AI Lessons")
+    lessons = get_lessons(50)
+    if not lessons:
+        st.info("Lessons appear here after the agent analyzes missed predictions (every 5 misses) or during optimizer runs.")
     else:
-        df_opt = pd.DataFrame(opt_hist)
-        df_opt["timestamp"] = pd.to_datetime(df_opt["timestamp"]).dt.strftime("%m-%d %H:%M")
+        lm1,lm2 = st.columns(2)
+        with lm1: st.metric("Total Lessons", len(lessons))
+        with lm2:
+            avg_imp = sum(l.get("predicted_improvement",0) for l in lessons) / len(lessons)
+            st.metric("Avg Expected Improvement", f"+{avg_imp*100:.2f}%")
 
-        st.subheader("Score History (all-time)")
-        st.line_chart(
-            df_opt.sort_values("id").set_index("id")["score"],
-            use_container_width=True,
-            color="#00d4ff",
-        )
+        for l in lessons[:20]:
+            with st.expander(f"🧠 {l['timestamp'][:16]}  ·  {l.get('bias_detected','')[:60]}"):
+                st.markdown(f"**Lesson:** {l.get('lesson','')}")
+                st.caption(f"Misses: {l.get('total_misses',0)}  ·  Correct: {l.get('total_correct',0)}")
+                st.caption(f"Expected Δ: +{l.get('predicted_improvement',0)*100:.1f}%")
 
+# ══════════════════════════════════════════════════════════════════════════════
+with tab_hist:
+    st.subheader("All Optimization Runs")
+    hist = get_optimizer_history(100)
+    if not hist:
+        st.info("No optimizer runs yet.")
+    else:
+        df_h = pd.DataFrame(hist)
+        st.line_chart(df_h.set_index("id")["score"], use_container_width=True, color="#00d4ff")
+        df_h["timestamp"] = pd.to_datetime(df_h["timestamp"]).dt.strftime("%m-%d %H:%M")
         st.dataframe(
-            df_opt[["timestamp", "iteration", "score", "notes"]].rename(columns={
-                "timestamp": "Time",
-                "iteration": "Iter",
-                "score":     "Score",
-                "notes":     "Notes",
-            }),
-            hide_index=True,
-            use_container_width=True,
+            df_h[["timestamp","iteration","score","notes"]].rename(
+                columns={"timestamp":"Time","iteration":"Iter","score":"Score","notes":"Notes"}
+            ),
+            hide_index=True, use_container_width=True,
         )
-
-        # Stats
-        hs1, hs2, hs3 = st.columns(3)
-        with hs1:
-            st.metric("Best Score",  f"{df_opt['score'].max():.4f}")
-        with hs2:
-            st.metric("Avg Score",   f"{df_opt['score'].mean():.4f}")
-        with hs3:
-            st.metric("Total Runs",  len(df_opt))
-
-        # Download
-        csv = df_opt.to_csv(index=False)
+        hs1,hs2,hs3 = st.columns(3)
+        with hs1: st.metric("Best Score", f"{df_h['score'].max():.4f}")
+        with hs2: st.metric("Avg Score",  f"{df_h['score'].mean():.4f}")
+        with hs3: st.metric("Runs",       len(df_h))
         st.download_button(
-            "⬇️ Download optimization history CSV",
-            data=csv,
-            file_name=f"optimizer_history_{datetime.now().strftime('%Y%m%d')}.csv",
-            mime="text/csv",
-            key="btn_dl_opt",
+            "⬇️ Download history CSV",
+            data=df_h.to_csv(index=False),
+            file_name=f"optimizer_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv", key="dl_opt",
         )

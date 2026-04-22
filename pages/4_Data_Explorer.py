@@ -1,5 +1,4 @@
 import sys
-import json
 from pathlib import Path
 
 import numpy as np
@@ -11,311 +10,270 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from utils.database import init_db
-from utils.features import FEATURE_NAMES, build_state
+from utils.features  import FEATURE_NAMES, build_state, get_feature_importance
 
-st.set_page_config(
-    page_title="Data Explorer · NBA AI",
-    page_icon="🔍",
-    layout="wide",
-)
+st.set_page_config(page_title="Data Explorer · NBA AI", page_icon="🔍", layout="wide")
 
-if "db_initialized" not in st.session_state:
-    init_db()
-    st.session_state.db_initialized = True
-
+if "db_ready" not in st.session_state:
+    init_db(); st.session_state.db_ready = True
 if "agent" not in st.session_state:
     from utils.dqn_agent import DQNAgent
-    _a = DQNAgent()
-    _a.load()
-    st.session_state.agent = _a
+    a = DQNAgent(); a.load(); st.session_state.agent = a
 
 for key, default in [
-    ("espn_raw",   None),
-    ("sr_raw",     None),
-    ("sr_stand",   None),
-    ("espn_bpi_raw", None),
-    ("espn_teams_raw", None),
+    ("explorer_games",    None),
+    ("explorer_stand",    None),
+    ("explorer_bpi",      None),
+    ("explorer_sr_sched", None),
+    ("explorer_teams",    None),
+    ("explorer_news",     None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
 
 agent = st.session_state.agent
-
 st.markdown("## 🔍 Data Explorer")
-st.caption("Inspect raw API payloads, feature vectors, and model Q-values")
+st.caption("Browse raw ESPN & SportRadar data · inspect feature vectors · query Q-values")
 st.divider()
 
-tab_espn, tab_sr, tab_fv, tab_qvals, tab_news = st.tabs(
-    ["📺 ESPN", "📡 SportRadar", "🧮 Feature Vectors", "🧠 Q-Values", "📰 News"]
-)
+# ── Auto-load ESPN data once per session ───────────────────────────────────────
+if st.session_state.explorer_games is None:
+    with st.spinner("Auto-loading ESPN scoreboard…"):
+        try:
+            from utils.espn_api import fetch_espn_scoreboard, fetch_espn_standings, fetch_espn_power_index
+            st.session_state.explorer_games = fetch_espn_scoreboard()
+            st.session_state.explorer_stand = fetch_espn_standings()
+            st.session_state.explorer_bpi   = fetch_espn_power_index()
+        except Exception as e:
+            st.warning(f"Auto-load: {e}")
+            st.session_state.explorer_games = []
+            st.session_state.explorer_stand = {}
+            st.session_state.explorer_bpi   = {}
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  TAB 1: ESPN Data
+tab_espn, tab_sr, tab_fv, tab_qv, tab_news = st.tabs([
+    "📺 ESPN Live", "📡 SportRadar", "🧮 Feature Vectors", "🧠 Q-Values", "📰 News"
+])
+
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_espn:
-    st.subheader("ESPN Scoreboard")
-
-    ec1, ec2 = st.columns([2, 1])
+    ec1, ec2 = st.columns([2,1])
     with ec2:
-        fetch_espn = st.button("🔄 Fetch ESPN Scoreboard", key="btn_espn", use_container_width=True)
+        if st.button("🔄 Reload ESPN Data", key="btn_reload_espn", use_container_width=True):
+            with st.spinner("Fetching…"):
+                try:
+                    from utils.espn_api import fetch_espn_scoreboard, fetch_espn_standings, fetch_espn_power_index
+                    st.session_state.explorer_games = fetch_espn_scoreboard()
+                    st.session_state.explorer_stand = fetch_espn_standings()
+                    st.session_state.explorer_bpi   = fetch_espn_power_index()
+                    st.toast("ESPN data refreshed!", icon="📺")
+                except Exception as e:
+                    st.error(str(e))
     with ec1:
-        espn_view = st.radio(
-            "View", ["Table", "Raw JSON"], horizontal=True, key="espn_view"
-        )
+        view = st.radio("View mode", ["Table","Raw JSON"], horizontal=True, key="espn_view")
 
-    if fetch_espn:
-        with st.spinner("Fetching ESPN scoreboard…"):
-            from utils.espn_api import fetch_espn_scoreboard, fetch_espn_standings, fetch_espn_power_index
-            try:
-                games = fetch_espn_scoreboard()
-                standings = fetch_espn_standings()
-                bpi = fetch_espn_power_index()
-                st.session_state.espn_raw = {
-                    "games":     games,
-                    "standings": standings,
-                    "bpi":       bpi,
-                }
-                st.toast(f"ESPN: {len(games)} games fetched", icon="📺")
-            except Exception as exc:
-                st.error(f"ESPN fetch error: {exc}")
+    games     = st.session_state.explorer_games or []
+    standings = st.session_state.explorer_stand or {}
+    bpi       = st.session_state.explorer_bpi   or {}
 
-    if st.session_state.espn_raw:
-        raw = st.session_state.espn_raw
-        games = raw.get("games", [])
+    st.caption(f"**{len(games)} games** · **{len(standings)} teams in standings** · **{len(bpi)} BPI entries**")
 
-        st.caption(f"**{len(games)} games** on today's ESPN scoreboard")
-
-        if espn_view == "Table" and games:
+    if games:
+        if view == "Table":
             df_g = pd.DataFrame(games)
-            display_cols = [c for c in [
-                "away_team", "home_team", "away_score", "home_score",
-                "status", "odds_spread", "source"
-            ] if c in df_g.columns]
-            st.dataframe(df_g[display_cols], hide_index=True, use_container_width=True)
-
-            st.subheader("Standings (Win %)")
-            df_s = pd.DataFrame(
-                list(raw["standings"].items()), columns=["Team", "Win %"]
-            ).sort_values("Win %", ascending=False)
-            st.dataframe(df_s, hide_index=True, use_container_width=True)
-
-            if raw["bpi"]:
-                st.subheader("ESPN Power Index (BPI)")
-                df_bpi = pd.DataFrame(
-                    list(raw["bpi"].items()), columns=["Team", "BPI"]
-                ).sort_values("BPI", ascending=False)
-                st.bar_chart(df_bpi.set_index("Team")["BPI"], use_container_width=True)
-
+            display = [c for c in ["away_team","away_abbr","home_team","home_abbr",
+                                   "away_score","home_score","status_desc","odds_spread",
+                                   "over_under","home_win_pct","away_win_pct","is_live","is_final","source"]
+                       if c in df_g.columns]
+            st.dataframe(df_g[display], use_container_width=True, hide_index=True)
         else:
-            st.json(raw)
-    else:
-        st.info("Click **Fetch ESPN Scoreboard** to load data.")
+            st.json(games[:5])  # show first 5 to avoid clutter
 
-    # ESPN Teams reference
-    st.subheader("ESPN Team Reference")
-    if st.button("Load All NBA Teams", key="btn_teams"):
-        with st.spinner("Loading teams…"):
+    if standings:
+        st.subheader("Standings (Win %)")
+        df_s = pd.DataFrame(standings.items(), columns=["Team","Win%"]).sort_values("Win%", ascending=False)
+        sc1, sc2 = st.columns([1,2])
+        with sc1:
+            st.dataframe(df_s, hide_index=True, use_container_width=True)
+        with sc2:
+            st.bar_chart(df_s.set_index("Team")["Win%"], use_container_width=True)
+
+    if bpi:
+        st.subheader("ESPN Power Index (BPI)")
+        df_bpi = pd.DataFrame(bpi.items(), columns=["Team","BPI"]).sort_values("BPI", ascending=False)
+        st.bar_chart(df_bpi.set_index("Team")["BPI"], use_container_width=True)
+
+    # Teams
+    if st.button("📋 Load All NBA Teams", key="btn_teams"):
+        with st.spinner():
             from utils.espn_api import fetch_espn_teams
-            try:
-                teams = fetch_espn_teams()
-                st.session_state.espn_teams_raw = teams
-            except Exception as exc:
-                st.error(f"Teams fetch error: {exc}")
+            st.session_state.explorer_teams = fetch_espn_teams()
 
-    if st.session_state.espn_teams_raw:
-        df_teams = pd.DataFrame(st.session_state.espn_teams_raw)
-        st.dataframe(df_teams, hide_index=True, use_container_width=True)
+    if st.session_state.explorer_teams:
+        st.subheader("All NBA Teams")
+        st.dataframe(pd.DataFrame(st.session_state.explorer_teams),
+                     hide_index=True, use_container_width=True)
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  TAB 2: SportRadar Data
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_sr:
-    st.subheader("SportRadar Schedule")
-    st.caption("Uses trial API key — rate-limited to ~1 req/s. Errors are expected on heavy usage.")
+    sr1, sr2 = st.columns([2,1])
+    with sr2:
+        if st.button("🔄 Fetch SR Schedule", key="btn_sr", use_container_width=True):
+            with st.spinner():
+                try:
+                    from utils.sportradar import fetch_sr_todays_schedule, fetch_sr_standings
+                    st.session_state.explorer_sr_sched = {
+                        "schedule": fetch_sr_todays_schedule(),
+                        "standings": fetch_sr_standings(),
+                    }
+                    st.toast("SportRadar loaded!", icon="📡")
+                except Exception as e:
+                    st.error(str(e))
+    with sr1:
+        st.caption("⚠️ Trial API key — rate-limited to ~1 req/s · errors expected on fast calls")
 
-    src1, src2 = st.columns([2, 1])
-    with src2:
-        fetch_sr = st.button("🔄 Fetch SR Schedule", key="btn_sr", use_container_width=True)
-    with src1:
-        sr_view = st.radio("View", ["Table", "Raw JSON"], horizontal=True, key="sr_view")
+    if st.session_state.explorer_sr_sched:
+        sr_data = st.session_state.explorer_sr_sched
+        sched   = sr_data.get("schedule", [])
+        stand   = sr_data.get("standings", {})
+        st.caption(f"SR schedule: {len(sched)} games  |  standings: {len(stand)} teams")
 
-    if fetch_sr:
-        with st.spinner("Fetching SportRadar schedule…"):
-            from utils.sportradar import fetch_sr_todays_schedule, fetch_sr_standings
-            try:
-                sr_sched    = fetch_sr_todays_schedule()
-                sr_standings = fetch_sr_standings()
-                st.session_state.sr_raw   = sr_sched
-                st.session_state.sr_stand = sr_standings
-                st.toast(f"SR: {len(sr_sched)} games fetched", icon="📡")
-            except Exception as exc:
-                st.error(f"SportRadar fetch error: {exc}")
-
-    if st.session_state.sr_raw is not None:
-        sched = st.session_state.sr_raw
-        st.caption(f"**{len(sched)} games** from SportRadar today")
-        if sr_view == "Table" and sched:
+        if sched:
             df_sr = pd.DataFrame(sched)
             st.dataframe(df_sr, hide_index=True, use_container_width=True)
-        else:
-            st.json(sched)
 
-        if st.session_state.sr_stand:
-            st.subheader("SR Standings (Win %)")
-            df_sr_s = pd.DataFrame(
-                list(st.session_state.sr_stand.items()), columns=["Abbr", "Win %"]
-            ).sort_values("Win %", ascending=False)
-            st.dataframe(df_sr_s, hide_index=True, use_container_width=True)
-    else:
-        st.info("Click **Fetch SR Schedule** to load data.")
+        if stand:
+            st.subheader("SR Standings")
+            df_ss = pd.DataFrame(stand.items(), columns=["Abbr","Win%"]).sort_values("Win%", ascending=False)
+            st.dataframe(df_ss, hide_index=True, use_container_width=True)
 
-    st.subheader("Manual Boxscore Lookup")
-    game_id_input = st.text_input(
-        "Enter game ID (from SR schedule above):", key="ti_game_id",
-        placeholder="e.g. 91a4c9e4-ade9-4d1c-…"
-    )
-    if st.button("Fetch Boxscore", key="btn_box") and game_id_input:
-        with st.spinner(f"Fetching boxscore for {game_id_input}…"):
-            from utils.sportradar import fetch_sr_boxscore
-            try:
-                box = fetch_sr_boxscore(game_id_input.strip())
+        st.subheader("Manual Boxscore Lookup")
+        gid = st.text_input("Game ID", key="ti_gid", placeholder="paste SR game id…")
+        if st.button("Fetch Boxscore", key="btn_box") and gid:
+            with st.spinner():
+                from utils.sportradar import fetch_sr_boxscore
+                box = fetch_sr_boxscore(gid.strip())
                 st.json(box)
-            except Exception as exc:
-                st.error(f"Boxscore error: {exc}")
+    else:
+        st.info("Click **Fetch SR Schedule** to load SportRadar data.")
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  TAB 3: Feature Vectors
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_fv:
     st.subheader("Feature Vector Inspector")
-    st.caption(
-        "Select any game from the ESPN scoreboard to inspect the 12-D normalized "
-        "state vector fed into the DQN."
-    )
+    games = st.session_state.explorer_games or []
+    stand = st.session_state.explorer_stand or {}
+    bpi   = st.session_state.explorer_bpi   or {}
 
-    if not st.session_state.espn_raw or not st.session_state.espn_raw.get("games"):
-        st.info("Fetch ESPN data (in the **📺 ESPN** tab) to inspect feature vectors.")
+    if not games:
+        st.info("Load ESPN data in the 📺 ESPN Live tab first.")
     else:
-        games     = st.session_state.espn_raw["games"]
-        standings = st.session_state.espn_raw.get("standings", {})
-        bpi_data  = st.session_state.espn_raw.get("bpi", {})
-        options   = [f"{g['away_team']} @ {g['home_team']}" for g in games]
+        options = [f"{g.get('away_abbr','?')} @ {g.get('home_abbr','?')}" for g in games]
+        sel     = st.selectbox("Select game", options, key="sel_fv_game")
+        idx     = options.index(sel)
+        game    = games[idx]
 
-        sel = st.selectbox("Select game", options, key="sel_game_fv")
-        idx = options.index(sel)
-        game = games[idx]
+        try:
+            state = build_state(game, stand, bpi)
+            st.success("✅ Feature vector built")
 
-        with st.spinner("Building state vector…"):
-            try:
-                state = build_state(game, standings, bpi_data)
-                st.success("Feature vector computed successfully")
+            fv1, fv2 = st.columns([1,2])
+            with fv1:
+                df_fv = pd.DataFrame({
+                    "Feature":    FEATURE_NAMES,
+                    "Normalized": [round(float(v),4) for v in state],
+                })
+                st.dataframe(df_fv, hide_index=True, use_container_width=True)
+            with fv2:
+                st.bar_chart(pd.DataFrame({"value": state}, index=FEATURE_NAMES),
+                             use_container_width=True)
 
-                fv_col1, fv_col2 = st.columns([1, 2])
-                with fv_col1:
-                    df_fv = pd.DataFrame({
-                        "Feature": FEATURE_NAMES,
-                        "Raw (norm.)": [round(float(v), 4) for v in state],
-                    })
-                    st.dataframe(df_fv, hide_index=True, use_container_width=True)
-                with fv_col2:
-                    st.bar_chart(
-                        pd.DataFrame(
-                            {"value": state}, index=FEATURE_NAMES
-                        ),
-                        use_container_width=True,
-                    )
-            except Exception as exc:
-                st.error(f"Feature vector error: {exc}")
+            # Show raw game dict used for feature building
+            with st.expander("Raw game dict"):
+                st.json({k: v for k,v in game.items()
+                         if k not in ("state","home_color","away_color")})
+        except Exception as e:
+            st.error(f"Feature build error: {e}")
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  TAB 4: Q-Values
-# ══════════════════════════════════════════════════════════════════════════════
-with tab_qvals:
-    st.subheader("DQN Q-Value Inspector")
-    st.caption(
-        "Inspect raw Q-values, softmax probabilities, and confidence for any "
-        "custom or live state vector."
-    )
+with tab_qv:
+    st.subheader("Q-Value Inspector")
+    mode = st.radio("Input source", ["Live game","Custom sliders"], horizontal=True, key="qv_mode")
+    state_qv: np.ndarray | None = None
 
-    input_mode = st.radio(
-        "State source", ["Use live game", "Custom state"], horizontal=True, key="qv_mode"
-    )
-
-    state_for_qv: np.ndarray | None = None
-
-    if input_mode == "Use live game":
-        if not st.session_state.espn_raw or not st.session_state.espn_raw.get("games"):
-            st.info("Fetch ESPN data first.")
+    if mode == "Live game":
+        games = st.session_state.explorer_games or []
+        if not games:
+            st.info("Load ESPN data first.")
         else:
-            games_q   = st.session_state.espn_raw["games"]
-            standings = st.session_state.espn_raw.get("standings", {})
-            bpi_data  = st.session_state.espn_raw.get("bpi", {})
-            opt_q     = [f"{g['away_team']} @ {g['home_team']}" for g in games_q]
-            sel_q     = st.selectbox("Select game", opt_q, key="sel_qv_game")
-            idx_q     = opt_q.index(sel_q)
+            opts = [f"{g.get('away_abbr','?')} @ {g.get('home_abbr','?')}" for g in games]
+            sel  = st.selectbox("Game", opts, key="sel_qv")
             try:
-                state_for_qv = build_state(games_q[idx_q], standings, bpi_data)
-            except Exception as exc:
-                st.error(f"Feature build error: {exc}")
+                state_qv = build_state(
+                    games[opts.index(sel)],
+                    st.session_state.explorer_stand or {},
+                    st.session_state.explorer_bpi   or {},
+                )
+            except Exception as e:
+                st.error(str(e))
     else:
-        st.caption("Adjust each feature (0.0 = min, 1.0 = max):")
-        custom_vals = []
-        qv_col1, qv_col2 = st.columns(2)
+        vals = []
+        qc1, qc2 = st.columns(2)
         for i, name in enumerate(FEATURE_NAMES):
-            col = qv_col1 if i < 6 else qv_col2
+            col = qc1 if i < 6 else qc2
             with col:
-                v = st.slider(name, 0.0, 1.0, 0.5, step=0.01, key=f"sl_qv_{name}")
-                custom_vals.append(v)
-        state_for_qv = np.array(custom_vals, dtype=np.float32)
+                vals.append(st.slider(name, 0.0, 1.0, 0.5, 0.01, key=f"sl_qv_{name}"))
+        state_qv = np.array(vals, dtype=np.float32)
 
-    if state_for_qv is not None:
-        import tensorflow as tf
-        q_vals  = agent.get_q_values(state_for_qv)
-        probs   = tf.nn.softmax(q_vals).numpy()
-        action  = int(np.argmax(q_vals))
-        action_lbl = "🏠 Home wins" if action == 1 else "✈️ Away wins"
+    if state_qv is not None:
+        from utils.numpy_dqn import softmax
+        q      = agent.get_q_values(state_qv)
+        probs  = softmax(q)
+        action = int(np.argmax(q))
+        lbl    = "🏠 Home wins" if action == 1 else "✈️ Away wins"
 
-        qc1, qc2, qc3 = st.columns(3)
-        with qc1:
-            st.metric("Prediction",   action_lbl)
-        with qc2:
-            st.metric("Confidence",   f"{float(np.max(probs))*100:.1f}%")
-        with qc3:
-            st.metric("Q spread",     f"{abs(q_vals[0]-q_vals[1]):.4f}")
+        qr1,qr2,qr3 = st.columns(3)
+        with qr1: st.metric("Prediction",    lbl)
+        with qr2: st.metric("Confidence",    f"{float(np.max(probs))*100:.1f}%")
+        with qr3: st.metric("Q-value spread",f"{abs(float(q[0]-q[1])):.4f}")
 
-        df_qv = pd.DataFrame({
-            "Action":       ["Away wins (0)", "Home wins (1)"],
-            "Q-Value":      [round(float(q_vals[0]), 4), round(float(q_vals[1]), 4)],
-            "Probability":  [round(float(probs[0]), 4), round(float(probs[1]), 4)],
+        df_q = pd.DataFrame({
+            "Action":      ["Away wins (0)", "Home wins (1)"],
+            "Q-Value":     [round(float(q[0]),4), round(float(q[1]),4)],
+            "Probability": [round(float(probs[0]),4), round(float(probs[1]),4)],
         })
-        st.dataframe(df_qv, hide_index=True, use_container_width=True)
-        st.bar_chart(df_qv.set_index("Action")["Q-Value"], use_container_width=True)
+        st.dataframe(df_q, hide_index=True, use_container_width=True)
+        st.bar_chart(df_q.set_index("Action")["Q-Value"], use_container_width=True)
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  TAB 5: News
 # ══════════════════════════════════════════════════════════════════════════════
 with tab_news:
     st.subheader("ESPN NBA News")
-
-    if st.button("🗞️ Load Latest News", key="btn_news"):
-        with st.spinner("Fetching ESPN news…"):
-            from utils.espn_api import fetch_espn_news
+    if st.session_state.explorer_news is None:
+        with st.spinner("Loading headlines…"):
             try:
-                news = fetch_espn_news(limit=10)
-                st.session_state.latest_news = news
-            except Exception as exc:
-                st.error(f"News fetch error: {exc}")
+                from utils.espn_api import fetch_espn_news
+                st.session_state.explorer_news = fetch_espn_news(15)
+            except Exception as e:
+                st.warning(str(e))
+                st.session_state.explorer_news = []
 
-    if "latest_news" in st.session_state and st.session_state.latest_news:
-        for article in st.session_state.latest_news:
+    if st.button("🔄 Refresh News", key="btn_refresh_news"):
+        with st.spinner():
+            from utils.espn_api import fetch_espn_news
+            st.session_state.explorer_news = fetch_espn_news(15)
+
+    news = st.session_state.explorer_news or []
+    if news:
+        for a in news:
             with st.container():
-                st.markdown(f"**{article['headline']}**")
-                if article.get("description"):
-                    st.caption(article["description"])
-                if article.get("published"):
-                    st.caption(f"Published: {article['published'][:10]}")
-                if article.get("url"):
-                    st.markdown(f"[Read more]({article['url']})")
+                st.markdown(f"**{a.get('headline','')}**")
+                if a.get("description"):
+                    st.caption(a["description"])
+                meta = []
+                if a.get("published"):   meta.append(a["published"][:10])
+                if a.get("source"):      meta.append(a["source"])
+                if meta:
+                    st.caption("  ·  ".join(meta))
+                if a.get("url"):
+                    st.markdown(f"[Read full article →]({a['url']})")
                 st.markdown("---")
     else:
-        st.info("Click **Load Latest News** to fetch ESPN NBA headlines.")
+        st.info("No news loaded.")
